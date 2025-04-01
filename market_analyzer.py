@@ -249,15 +249,40 @@ class MarketAnalyzer:
                 return []
                 
             # Получаем текущую цену
-            bids = orderbook[orderbook['side'] == 'bid']
-            asks = orderbook[orderbook['side'] == 'ask']
-            if not bids.empty and not asks.empty:
-                best_bid = float(bids['price'].max())
-                best_ask = float(asks['price'].min())
-                current_price = Decimal(str((best_bid + best_ask) / 2))
-            else:
-                logger.warning(f"Пустой стакан для {symbol}")
-                return []
+            try:
+                # Сначала пробуем получить через REST API
+                ticker = self.binance_client.get_symbol_ticker(symbol=symbol)
+                current_price = Decimal(str(ticker['price']))
+                
+                # Проверяем, что цена находится в разумных пределах
+                if symbol == 'BTCUSDT':
+                    if current_price < 1000 or current_price > 100000:
+                        raise ValueError(f"Некорректная цена BTC: {current_price}")
+                elif symbol == 'ETHUSDT':
+                    if current_price < 100 or current_price > 10000:
+                        raise ValueError(f"Некорректная цена ETH: {current_price}")
+                elif symbol == 'BNBUSDT':
+                    if current_price < 10 or current_price > 1000:
+                        raise ValueError(f"Некорректная цена BNB: {current_price}")
+                elif symbol == 'SOLUSDT':
+                    if current_price < 1 or current_price > 1000:
+                        raise ValueError(f"Некорректная цена SOL: {current_price}")
+                elif symbol == 'XRPUSDT':
+                    if current_price < 0.1 or current_price > 10:
+                        raise ValueError(f"Некорректная цена XRP: {current_price}")
+                        
+            except Exception as e:
+                logger.error(f"Ошибка при получении текущей цены через REST API: {e}")
+                # Если не удалось получить через REST API, используем стакан
+                bids = orderbook[orderbook['side'] == 'bid']
+                asks = orderbook[orderbook['side'] == 'ask']
+                if not bids.empty and not asks.empty:
+                    best_bid = float(bids['price'].max())
+                    best_ask = float(asks['price'].min())
+                    current_price = Decimal(str((best_bid + best_ask) / 2))
+                else:
+                    logger.warning(f"Пустой стакан для {symbol}")
+                    return []
             
             # Подготавливаем данные для анализа
             orderbook_data = {
@@ -439,6 +464,21 @@ class MarketAnalyzer:
                 logger.error(f"Отсутствует текущая цена для {symbol}")
                 return []
 
+            # Рассчитываем диапазон цен (±10%)
+            price_range = Decimal('0.10')  # 10%
+            min_price = current_price * (Decimal('1') - price_range)
+            max_price = current_price * (Decimal('1') + price_range)
+
+            # Фильтруем ордера в заданном диапазоне
+            filtered_orderbook = orderbook[
+                (orderbook['price'] >= float(min_price)) & 
+                (orderbook['price'] <= float(max_price))
+            ]
+
+            if filtered_orderbook.empty:
+                logger.warning(f"Нет ордеров в диапазоне ±10% для {symbol}")
+                return []
+
             # Рассчитываем средний объем в стакане
             total_volume = Decimal('0')
             total_orders = 0
@@ -446,7 +486,7 @@ class MarketAnalyzer:
             ask_volume = Decimal('0')
             
             # Считаем объемы по бидам
-            for _, row in orderbook[orderbook['side'] == 'bid'].iterrows():
+            for _, row in filtered_orderbook[filtered_orderbook['side'] == 'bid'].iterrows():
                 try:
                     volume_usdt = self._calculate_volume(str(row['price']), str(row['quantity']))
                     # Проверяем минимальный объем ордера
@@ -459,7 +499,7 @@ class MarketAnalyzer:
                     continue
             
             # Считаем объемы по аскам
-            for _, row in orderbook[orderbook['side'] == 'ask'].iterrows():
+            for _, row in filtered_orderbook[filtered_orderbook['side'] == 'ask'].iterrows():
                 try:
                     volume_usdt = self._calculate_volume(str(row['price']), str(row['quantity']))
                     # Проверяем минимальный объем ордера
@@ -482,11 +522,11 @@ class MarketAnalyzer:
             clusters = []
             
             # Обрабатываем биды
-            bid_clusters = self._group_orders(orderbook[orderbook['side'] == 'bid'], avg_volume, 'bid')
+            bid_clusters = self._group_orders(filtered_orderbook[filtered_orderbook['side'] == 'bid'], avg_volume, 'bid')
             clusters.extend(bid_clusters)
             
             # Обрабатываем аски
-            ask_clusters = self._group_orders(orderbook[orderbook['side'] == 'ask'], avg_volume, 'ask')
+            ask_clusters = self._group_orders(filtered_orderbook[filtered_orderbook['side'] == 'ask'], avg_volume, 'ask')
             clusters.extend(ask_clusters)
 
             # Логируем информацию о найденных кластерах
@@ -494,6 +534,7 @@ class MarketAnalyzer:
                 logger.info(f"\n{'='*50}")
                 logger.info(f"Найдены кластеры для {symbol}")
                 logger.info(f"Текущая цена: {current_price:.8f}")
+                logger.info(f"Диапазон анализа: [{min_price:.8f}, {max_price:.8f}]")
                 logger.info(f"{'='*50}")
                 
                 # Группируем кластеры по стороне
@@ -813,15 +854,31 @@ class MarketAnalyzer:
                 
             orderbook = self.orderbooks[symbol]
             
-            # Получаем текущие кластеры
-            current_clusters = self._analyze_clusters(symbol)
+            # Получаем текущую цену
+            try:
+                # Получаем текущую цену через REST API
+                ticker = self.binance_client.get_symbol_ticker(symbol=symbol)
+                current_price = Decimal(str(ticker['price']))
+            except Exception as e:
+                logger.error(f"Ошибка при получении текущей цены для {symbol}: {str(e)}")
+                return []
+
+            # Подготавливаем данные для анализа
+            orderbook_data = {
+                'current_price': current_price,
+                'bids': orderbook[orderbook['side'] == 'bid'][['price', 'quantity']].values.tolist(),
+                'asks': orderbook[orderbook['side'] == 'ask'][['price', 'quantity']].values.tolist()
+            }
+
+            # Анализируем кластеры
+            clusters = self._analyze_clusters(symbol)
             
             # Обновляем кластеры
-            self.liquidity_clusters[symbol] = current_clusters
+            self.liquidity_clusters[symbol] = clusters
             
             # Проверяем изменения в кластерах
             if symbol in self.previous_clusters:
-                for cluster in current_clusters:
+                for cluster in clusters:
                     # Проверяем, является ли кластер новым или значительно изменившимся
                     is_new = True
                     for prev_cluster in self.previous_clusters[symbol]:
@@ -837,7 +894,7 @@ class MarketAnalyzer:
                         self._send_cluster_notification(symbol, cluster, 'появился')
             
             # Сохраняем текущие кластеры для следующего сравнения
-            self.previous_clusters[symbol] = current_clusters
+            self.previous_clusters[symbol] = clusters
             
             # Сохраняем кластеры в файл
             if datetime.now() - self.last_cluster_save > self.cluster_save_interval:
@@ -872,10 +929,22 @@ class MarketAnalyzer:
             min_price = current_price * (1 - price_range)
             max_price = current_price * (1 + price_range)
             
-            # Анализируем кластеры
+            # Фильтруем ордера в заданном диапазоне
+            filtered_bids = [[price, qty] for price, qty in bids if min_price <= float(price) <= max_price]
+            filtered_asks = [[price, qty] for price, qty in asks if min_price <= float(price) <= max_price]
+            
+            # Создаем DataFrame с отфильтрованными ордерами
+            bids_data = [[float(price), float(qty), 'bid'] for price, qty in filtered_bids]
+            asks_data = [[float(price), float(qty), 'ask'] for price, qty in filtered_asks]
+            filtered_orderbook = pd.DataFrame(bids_data + asks_data, columns=['price', 'quantity', 'side'])
+            
+            # Обновляем данные стакана
+            self.orderbooks[symbol] = filtered_orderbook
+            
+            # Анализируем кластеры только для отфильтрованных ордеров
             clusters = self._analyze_clusters(symbol)
             
-            # Отправляем уведомления о новых кластерах только в заданном диапазоне
+            # Отправляем уведомления о новых кластерах
             for cluster in clusters:
                 if (cluster['volume_usdt'] >= self.min_cluster_volume and 
                     min_price <= float(cluster['start_price']) <= max_price):

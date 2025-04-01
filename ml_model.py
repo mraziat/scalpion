@@ -166,16 +166,16 @@ class PricePredictionModel:
             ask_clusters = [c for c in clusters if c['side'] == 'ask']
             
             # Рассчитываем средний объем кластеров
-            bid_volume = np.mean([c['quantity'] for c in bid_clusters]) if bid_clusters else 0
-            ask_volume = np.mean([c['quantity'] for c in ask_clusters]) if ask_clusters else 0
+            bid_volume = np.mean([c['volume'] for c in bid_clusters]) if bid_clusters else 0
+            ask_volume = np.mean([c['volume'] for c in ask_clusters]) if ask_clusters else 0
             
             # Рассчитываем количество кластеров
             bid_count = len(bid_clusters)
             ask_count = len(ask_clusters)
             
-            # Рассчитываем среднюю цену кластеров
-            bid_price = np.mean([c['price'] for c in bid_clusters]) if bid_clusters else 0
-            ask_price = np.mean([c['price'] for c in ask_clusters]) if ask_clusters else 0
+            # Рассчитываем среднюю цену кластеров (берем среднее из диапазона цен)
+            bid_price = np.mean([sum(c['price_range'])/2 for c in bid_clusters]) if bid_clusters else 0
+            ask_price = np.mean([sum(c['price_range'])/2 for c in ask_clusters]) if ask_clusters else 0
             
             return [bid_volume, ask_volume, bid_count, ask_count, (bid_price + ask_price) / 2]
             
@@ -199,10 +199,7 @@ class PricePredictionModel:
             else:
                 trend = 0
                 
-            # Рассчитываем объем
-            volume = np.mean([h['quantity'] for h in historical]) if historical else 0
-            
-            return [volatility, trend, volume]
+            return [volatility, trend, len(prices)]
             
         except Exception as e:
             logger.error(f"Ошибка при извлечении исторических паттернов: {e}")
@@ -255,90 +252,99 @@ class PricePredictionModel:
             logger.error(f"Ошибка при обучении модели: {e}")
             logger.error("Traceback:", exc_info=True)
             
-    async def predict(self, orderbook_data: pd.DataFrame) -> Dict[str, float]:
-        """Получение предсказания от модели"""
+    async def predict(self, data: Dict) -> Dict:
+        """
+        Получение предсказания от модели
+        
+        Args:
+            data: Словарь с данными для предсказания
+            
+        Returns:
+            Dict: Словарь с предсказаниями
+        """
         try:
-            # Подготавливаем данные
-            features = self.prepare_features(orderbook_data)
+            # Подготавливаем признаки
+            features = self.prepare_features(data)
             
-            # Получаем предсказание
-            prediction = self.model.predict(features)
+            if features is None:
+                logger.error("Не удалось подготовить признаки для модели")
+                return {'probability': 0.5, 'position_size': 0.0}
             
-            # Извлекаем вероятность и размер позиции
-            probability = float(prediction[0][0])
-            position_size = float(prediction[0][1])
+            # Получаем предсказания
+            probability, position_size = self.model.predict(features)
             
-            # Логируем предсказание
-            logger.info(f"\n{'='*50}")
-            logger.info("Предсказание ML-модели:")
-            logger.info(f"Вероятность движения: {probability:.2%}")
-            logger.info(f"Рекомендуемый размер позиции: {position_size:.2%}")
-            logger.info(f"{'='*50}\n")
-            
+            # Преобразуем в нужный формат
             return {
-                'probability': probability,
-                'position_size': position_size
+                'probability': float(probability[0][0]),  # Вероятность движения
+                'position_size': float(position_size[0][0])  # Рекомендуемый размер позиции
             }
             
         except Exception as e:
             logger.error(f"Ошибка при получении предсказания: {e}")
             logger.error(traceback.format_exc())
-            return {
-                'probability': 0.0,
-                'position_size': 0.0
-            }
+            return {'probability': 0.5, 'position_size': 0.0}
     
     def save_model(self, path: str) -> None:
         """
-        Сохранение модели
+        Сохранение модели и скейлера
         
         Args:
             path: Путь для сохранения
         """
         try:
-            # Сохраняем модель
-            self.model.save(path)
+            # Создаем директорию, если не существует
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             
-            # Получаем директорию из пути к файлу
-            model_dir = os.path.dirname(path)
+            # Сохраняем модель
+            self.model.save(f"{path}_model")
+            logger.info(f"Модель сохранена в {path}_model")
             
             # Сохраняем скейлер
             if self.scaler is not None:
-                joblib.dump(self.scaler, os.path.join(model_dir, 'scaler.pkl'))
-            
+                joblib.dump(self.scaler, f"{path}_scaler.joblib")
+                logger.info(f"Скейлер сохранен в {path}_scaler.joblib")
+                
             # Сохраняем метаданные
             metadata = {
                 'sequence_length': self.sequence_length,
                 'feature_dim': self.feature_dim,
-                'last_training_time': self.last_training_time.isoformat() if self.last_training_time else None,
-                'training_interval': self.training_interval.total_seconds()
+                'last_training_time': self.last_training_time.isoformat() if self.last_training_time else None
             }
-            
-            with open(os.path.join(model_dir, 'metadata.json'), 'w') as f:
+            with open(f"{path}_metadata.json", 'w') as f:
                 json.dump(metadata, f)
-                
-            logger.info(f"Модель успешно сохранена в {path}")
+            logger.info(f"Метаданные сохранены в {path}_metadata.json")
             
         except Exception as e:
             logger.error(f"Ошибка при сохранении модели: {e}")
-            logger.error("Traceback:", exc_info=True)
-    
+            logger.error(traceback.format_exc())
+            
     def load_model(self, path: str) -> None:
         """
-        Загрузка сохраненной модели
+        Загрузка модели и скейлера
         
         Args:
-            path: Путь к файлу модели
+            path: Путь к сохраненной модели
         """
         try:
-            # Регистрируем пользовательский слой
-            tf.keras.utils.get_custom_objects()['AttentionLayer'] = AttentionLayer
+            # Загружаем метаданные
+            with open(f"{path}_metadata.json", 'r') as f:
+                metadata = json.load(f)
+                
+            self.sequence_length = metadata['sequence_length']
+            self.feature_dim = metadata['feature_dim']
+            self.last_training_time = datetime.fromisoformat(metadata['last_training_time']) if metadata['last_training_time'] else None
             
             # Загружаем модель
-            self.model = tf.keras.models.load_model(path)
-            logger.info("Модель успешно загружена")
+            self.model = tf.keras.models.load_model(f"{path}_model", custom_objects={'AttentionLayer': AttentionLayer})
+            logger.info(f"Модель загружена из {path}_model")
+            
+            # Загружаем скейлер
+            scaler_path = f"{path}_scaler.joblib"
+            if os.path.exists(scaler_path):
+                self.scaler = joblib.load(scaler_path)
+                logger.info(f"Скейлер загружен из {scaler_path}")
             
         except Exception as e:
             logger.error(f"Ошибка при загрузке модели: {e}")
-            logger.error("Traceback:", exc_info=True)
+            logger.error(traceback.format_exc())
             raise 

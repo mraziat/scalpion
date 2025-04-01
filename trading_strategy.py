@@ -9,6 +9,7 @@ from market_analyzer import MarketAnalyzer
 import asyncio
 from ml_model import PricePredictionModel
 import traceback
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,22 @@ class TradingStrategy:
         self.klines_data = None
         self.active_positions = {}
         self.channels = {}
+        
+        # Инициализация ML модели
+        self.ml_model = PricePredictionModel()
+        
+        # Пытаемся загрузить сохраненную модель
+        model_path = config.get('ml_model_path', 'models/price_prediction_model')
+        try:
+            self.ml_model.load_model(model_path)
+            logger.info(f"Загружена ML модель из {model_path}")
+        except Exception as e:
+            logger.warning(f"Не удалось загрузить ML модель из {model_path}: {e}")
+            logger.warning("Будет использована новая модель")
+        
+        # Инициализация Telegram
+        self.telegram_bot = None
+        self.telegram_chat_id = None
         
         logger.info("Инициализирована торговая стратегия")
         
@@ -122,10 +139,9 @@ class TradingStrategy:
                         logger.info(f"Найдены кластеры ликвидности: {len(liquidity_clusters)}")
                         for cluster in liquidity_clusters:
                             logger.info(f"Кластер: сторона={cluster['side']}, "
-                                      f"цена={cluster['price']:.8f}, "
-                                      f"объем={cluster['volume_usdt']:.2f} USDT, "
-                                      f"ордера={cluster['orders']}, "
-                                      f"диапазон=[{cluster['min_price']:.8f}, {cluster['max_price']:.8f}]")
+                                      f"цена={cluster['price_range'][0]:.8f} - {cluster['price_range'][1]:.8f}, "
+                                      f"объем={cluster['volume']:.2f} USDT, "
+                                      f"ордера={cluster['orders']}")
                     
                         # Анализируем сигналы
                         signal = await self.analyze_signals(orderbook_data)
@@ -150,13 +166,27 @@ class TradingStrategy:
         """Анализ сигналов на основе данных стакана"""
         try:
             # Получаем текущую цену
-            current_price = float(orderbook_data['price'].iloc[-1])
+            bids = orderbook_data[orderbook_data['side'] == 'bid'].sort_values('price', ascending=False)
+            asks = orderbook_data[orderbook_data['side'] == 'ask'].sort_values('price', ascending=True)
+            
+            if not bids.empty and not asks.empty:
+                current_price = (float(bids.iloc[0]['price']) + float(asks.iloc[0]['price'])) / 2
+            else:
+                logger.warning("Не удалось получить текущую цену: пустой стакан")
+                return None
             
             # Получаем кластеры ликвидности
             liquidity_clusters = await self.market_analyzer._update_liquidity_clusters(self.symbol)
             
+            # Подготавливаем данные для ML модели
+            ml_data = {
+                'orderbook': orderbook_data,
+                'liquidity_clusters': liquidity_clusters,
+                'historical': []  # Пока не используем исторические данные
+            }
+            
             # Получаем предсказание от ML-модели
-            prediction = await self.ml_model.predict(orderbook_data)
+            prediction = await self.ml_model.predict(ml_data)
             self.current_probability = prediction['probability']
             self.current_position_size = prediction['position_size']
             
@@ -200,55 +230,24 @@ class TradingStrategy:
                 max_position_size = account_balance * 0.2  # Максимум 20% от баланса
                 position_size = min(position_size, max_position_size)
                 
-                # Рассчитываем стоп-лосс и тейк-профит
-                stop_loss, take_profit = self._calculate_sl_tp_from_clusters(
-                    current_price, side, liquidity_clusters
-                )
-                
-                # Формируем сигнал на открытие позиции
-                signal = {
+                return {
                     'action': 'open',
-                    'symbol': self.symbol,
                     'side': side,
                     'price': current_price,
-                    'quantity': position_size,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'probability': self.current_probability,
-                    'leverage': 3  # Указываем плечо
+                    'size': position_size,
+                    'probability': self.current_probability
                 }
-                
-                # Логируем сигнал
-                logger.info(f"\n{'='*50}")
-                logger.info(f"Сигнал на открытие позиции для {self.symbol}:")
-                logger.info(f"Сторона: {side}")
-                logger.info(f"Цена: {current_price:.8f}")
-                logger.info(f"Размер: {position_size:.4f}")
-                logger.info(f"Плечо: 3x")
-                logger.info(f"Стоп-лосс: {stop_loss:.8f}")
-                logger.info(f"Тейк-профит: {take_profit:.8f}")
-                logger.info(f"Вероятность: {self.current_probability:.2%}")
-                logger.info(f"{'='*50}\n")
-                
-                # Отправляем уведомление в Telegram
-                if self.telegram_bot and self.telegram_chat_id:
-                    message = (
-                        f"🎯 Сигнал на открытие позиции {self.symbol}:\n\n"
-                        f"Сторона: {side}\n"
-                        f"Цена: {current_price:.8f}\n"
-                        f"Размер: {position_size:.4f}\n"
-                        f"Плечо: 3x\n"
-                        f"Стоп-лосс: {stop_loss:.8f}\n"
-                        f"Тейк-профит: {take_profit:.8f}\n"
-                        f"Вероятность: {self.current_probability:.2%}"
-                    )
-                    await self.telegram_bot.send_message(
-                        chat_id=self.telegram_chat_id,
-                        text=message,
-                        parse_mode='HTML'
-                    )
-                
-                return signal
+            
+            # Проверяем условия для выхода из позиции
+            elif self.current_probability > self.exit_probability_threshold:
+                # Получаем активные позиции
+                active_positions = await self.order_executor.get_active_positions()
+                if active_positions:
+                    return {
+                        'action': 'close',
+                        'positions': active_positions,
+                        'probability': self.current_probability
+                    }
             
             return None
             
@@ -273,7 +272,7 @@ class TradingStrategy:
         try:
             # Фильтруем значимые кластеры
             significant_clusters = [c for c in liquidity_clusters 
-                                  if c['volume_usdt'] >= self.min_cluster_volume and
+                                  if c['volume'] >= self.min_cluster_volume and
                                   c['orders'] >= self.min_orders_in_cluster]
             
             if side == 'buy':
@@ -321,8 +320,8 @@ class TradingStrategy:
             ask_clusters = [c for c in liquidity_clusters if c['side'] == 'ask']
             
             # Считаем общий объем по каждой стороне
-            bid_volume = sum(c['volume_usdt'] for c in bid_clusters)
-            ask_volume = sum(c['volume_usdt'] for c in ask_clusters)
+            bid_volume = sum(c['volume'] for c in bid_clusters)
+            ask_volume = sum(c['volume'] for c in ask_clusters)
             
             # Определяем сторону на основе объема
             if bid_volume > ask_volume:
@@ -354,7 +353,7 @@ class TradingStrategy:
                     order = await self.order_executor.open_position(
                         symbol=signal['symbol'],
                         side=signal['side'],
-                        quantity=signal['quantity'],
+                        quantity=signal['size'],
                         price=signal['price'],
                         stop_loss=signal['stop_loss'],
                         take_profit=signal['take_profit']
@@ -366,7 +365,7 @@ class TradingStrategy:
                             symbol=signal['symbol'],
                             side=signal['side'],
                             entry_price=signal['price'],
-                            quantity=signal['quantity'],
+                            quantity=signal['size'],
                             stop_loss=signal['stop_loss'],
                             take_profit=signal['take_profit']
                         )
@@ -374,7 +373,7 @@ class TradingStrategy:
                         logger.info(f"Открыта позиция по {signal['symbol']}")
                         logger.info(f"Сторона: {signal['side']}")
                         logger.info(f"Цена: {signal['price']:.8f}")
-                        logger.info(f"Количество: {signal['quantity']:.8f}")
+                        logger.info(f"Количество: {signal['size']:.8f}")
                         logger.info(f"Стоп-лосс: {signal['stop_loss']:.8f}")
                         logger.info(f"Тейк-профит: {signal['take_profit']:.8f}")
                         
@@ -590,3 +589,40 @@ class TradingStrategy:
             logger.error(f"Критическая ошибка в стратегии: {str(e)}")
             logger.error(traceback.format_exc())
             raise 
+
+    async def analyze_orderbook(self, symbol: str, orderbook: pd.DataFrame):
+        """Анализ стакана и принятие торговых решений"""
+        try:
+            logger.info(f"\nОбработка стакана для {symbol}")
+            logger.info(f"Размер стакана: {len(orderbook)} ордеров")
+            logger.info(f"Биды: {len(orderbook[orderbook['side'] == 'bid'])} ордеров")
+            logger.info(f"Аски: {len(orderbook[orderbook['side'] == 'ask'])} ордеров")
+
+            # Получаем текущую цену
+            try:
+                ticker = self.binance_client.get_symbol_ticker(symbol=symbol)
+                current_price = Decimal(str(ticker['price']))
+                logger.info(f"Текущая цена: {current_price}")
+            except Exception as e:
+                logger.error(f"Ошибка при получении текущей цены: {str(e)}")
+                return
+
+            # Получаем кластеры ликвидности
+            clusters = self.market_analyzer.liquidity_clusters.get(symbol, [])
+            if not clusters:
+                logger.warning("Не найдены кластеры ликвидности")
+                return
+
+            # Анализируем кластеры
+            for cluster in clusters:
+                if cluster['side'] == 'bid':
+                    # Анализ кластера на покупку
+                    if self._is_good_buy_cluster(cluster, current_price):
+                        await self._execute_buy_order(symbol, cluster)
+                else:
+                    # Анализ кластера на продажу
+                    if self._is_good_sell_cluster(cluster, current_price):
+                        await self._execute_sell_order(symbol, cluster)
+
+        except Exception as e:
+            logger.error(f"Ошибка при анализе стакана: {str(e)}") 
