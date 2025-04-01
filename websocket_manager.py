@@ -10,31 +10,36 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 from datetime import datetime, timedelta
 import time
+from binance.client import Client
+from binance.streams import BinanceSocketManager
+from binance.enums import *
 
 logger = logging.getLogger(__name__)
 
 class WebSocketManager:
-    def __init__(self, client=None, cache_timeout: float = 1.0) -> None:
+    def __init__(self, client: Client, cache_timeout: float = 1.0) -> None:
         """
-        Инициализация менеджера WebSocket
+        Инициализация WebSocket менеджера
         
         Args:
-            client: Клиент Binance API (опционально)
-            cache_timeout: Время кэширования данных стакана в секундах
+            client: Клиент Binance
+            cache_timeout: Время жизни кэша в секундах
         """
         self.client = client
+        self.cache_timeout = cache_timeout
+        self.orderbook_cache = {}
+        self.last_update = {}
+        self.logger = logging.getLogger(__name__)
+        self.trading_pairs: List[str] = []
         self.connections: Dict[str, websockets.WebSocketClientProtocol] = {}
         self.callbacks: Dict[str, Callable] = {}
         self.is_running = False
-        self.reconnect_delay = 2  # Уменьшаем задержку перед повторным подключением
-        self.max_reconnect_attempts = 5  # Увеличиваем количество попыток
-        self.ping_interval = 15  # Уменьшаем интервал отправки ping
+        self.reconnect_delay = 5  # Увеличиваем задержку перед повторным подключением
+        self.max_reconnect_attempts = 10  # Увеличиваем количество попыток
+        self.ping_interval = 30  # Увеличиваем интервал отправки ping
         self.last_message_time: Dict[str, datetime] = {}
-        self.message_timeout = 30  # Уменьшаем таймаут получения сообщений
+        self.message_timeout = 60  # Увеличиваем таймаут получения сообщений
         self.ws_url = "wss://stream.binance.com:9443/ws"
-        self.orderbook_cache: Dict[str, Dict] = {}
-        self.cache_timeout = cache_timeout
-        self.last_update: Dict[str, float] = {}
         self.subscribed_symbols: Set[str] = set()
         self.reconnect_tasks: Dict[str, asyncio.Task] = {}
         
@@ -154,7 +159,14 @@ class WebSocketManager:
             stream_name: Имя потока
         """
         try:
-            ws = await websockets.connect(f"{self.ws_url}/{stream_name}")
+            # Увеличиваем таймаут подключения
+            ws = await websockets.connect(
+                f"{self.ws_url}/{stream_name}",
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=10,
+                max_size=10_000_000  # Увеличиваем максимальный размер сообщения
+            )
             
             self.connections[stream_name] = ws
             self.last_message_time[stream_name] = datetime.now()
@@ -283,41 +295,34 @@ class WebSocketManager:
             logger.error(traceback.format_exc())
             raise
 
-    async def get_orderbook(self, symbol: str) -> Optional[Dict]:
+    async def get_orderbook(self, symbol: str) -> Dict:
         """
-        Получение данных стакана
+        Получение стакана для указанного символа
         
         Args:
             symbol: Торговая пара
             
         Returns:
-            Dict: Данные стакана или None
+            Dict: Стакан
         """
         try:
             # Проверяем кэш
             if symbol in self.orderbook_cache:
-                last_update = self.last_update.get(symbol, 0)
-                if time.time() - last_update < self.cache_timeout:
+                last_update = self.last_update.get(symbol)
+                if last_update and (datetime.now() - last_update).total_seconds() < self.cache_timeout:
                     return self.orderbook_cache[symbol]
             
-            # Если WebSocket недоступен, используем REST API
-            if not self.client:
-                logger.warning("REST клиент не инициализирован")
-                return None
-                
-            # Получаем данные через REST API
-            orderbook = await self.client.get_orderbook_ticker(symbol=symbol)
+            # Получаем стакан через REST API
+            orderbook = self.client.get_order_book(symbol=symbol, limit=1000)
             
             # Обновляем кэш
-            if orderbook:
-                self.orderbook_cache[symbol] = orderbook
-                self.last_update[symbol] = time.time()
+            self.orderbook_cache[symbol] = orderbook
+            self.last_update[symbol] = datetime.now()
             
             return orderbook
             
         except Exception as e:
             logger.error(f"Ошибка при получении стакана для {symbol}: {e}")
-            logger.error(traceback.format_exc())
             return None
 
     async def _unsubscribe(self, stream_name: str) -> None:

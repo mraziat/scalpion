@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras import layers, Model
+import keras
+from keras import layers, Model
 from typing import Dict, List, Tuple, Optional
 import logging
 from datetime import datetime, timedelta
@@ -10,10 +11,11 @@ import os
 import json
 from sklearn.preprocessing import StandardScaler
 import traceback
+import asyncio
 
 logger = logging.getLogger(__name__)
 
-@tf.keras.utils.register_keras_serializable()
+@keras.saving.register_keras_serializable()
 class AttentionLayer(layers.Layer):
     def __init__(self, **kwargs):
         super(AttentionLayer, self).__init__(**kwargs)
@@ -45,6 +47,14 @@ class PricePredictionModel:
         self.training_data = []
         self.min_training_samples = 1000
         self.max_training_samples = 10000
+        
+        # Сохраняем начальную модель
+        try:
+            self.save_model('models/price_prediction_model')
+            logger.info("Сохранена начальная модель")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении начальной модели: {e}")
+            logger.error(traceback.format_exc())
         
     def _build_model(self) -> Model:
         """Построение архитектуры модели"""
@@ -95,18 +105,22 @@ class PricePredictionModel:
         try:
             features = []
             
-            # Признаки из стакана
+            # Признаки из стакана (5 признаков)
             orderbook_features = self._calculate_orderbook_density(data['orderbook'])
             features.extend(orderbook_features)
             
-            # Признаки из кластеров ликвидности
+            # Признаки из кластеров ликвидности (5 признаков)
             cluster_features = self._calculate_cluster_features(data['liquidity_clusters'])
             features.extend(cluster_features)
             
-            # Признаки из исторических данных
-            if 'historical' in data:
-                historical_features = self._extract_historical_patterns(data['historical'])
-                features.extend(historical_features)
+            # Проверяем количество признаков
+            if len(features) != 10:
+                logger.warning(f"Неверное количество признаков: {len(features)}, ожидается 10")
+                # Если признаков больше 10, берем только первые 10
+                features = features[:10]
+                # Если признаков меньше 10, дополняем нулями
+                while len(features) < 10:
+                    features.append(0.0)
             
             # Нормализация признаков
             if self.scaler is None:
@@ -122,7 +136,7 @@ class PricePredictionModel:
             
         except Exception as e:
             logger.error(f"Ошибка при подготовке признаков: {e}")
-            logger.error("Traceback:", exc_info=True)
+            logger.error(traceback.format_exc())
             return None
     
     def _calculate_orderbook_density(self, orderbook: pd.DataFrame) -> List[float]:
@@ -166,21 +180,29 @@ class PricePredictionModel:
             ask_clusters = [c for c in clusters if c['side'] == 'ask']
             
             # Рассчитываем средний объем кластеров
-            bid_volume = np.mean([c['volume'] for c in bid_clusters]) if bid_clusters else 0
-            ask_volume = np.mean([c['volume'] for c in ask_clusters]) if ask_clusters else 0
+            bid_volume = np.mean([c.get('cluster_volume', 0) for c in bid_clusters]) if bid_clusters else 0
+            ask_volume = np.mean([c.get('cluster_volume', 0) for c in ask_clusters]) if ask_clusters else 0
             
             # Рассчитываем количество кластеров
             bid_count = len(bid_clusters)
             ask_count = len(ask_clusters)
             
-            # Рассчитываем среднюю цену кластеров (берем среднее из диапазона цен)
-            bid_price = np.mean([sum(c['price_range'])/2 for c in bid_clusters]) if bid_clusters else 0
-            ask_price = np.mean([sum(c['price_range'])/2 for c in ask_clusters]) if ask_clusters else 0
+            # Рассчитываем среднюю цену кластеров
+            bid_price = np.mean([c.get('price_range', [0, 0])[0] for c in bid_clusters]) if bid_clusters else 0
+            ask_price = np.mean([c.get('price_range', [0, 0])[0] for c in ask_clusters]) if ask_clusters else 0
             
-            return [bid_volume, ask_volume, bid_count, ask_count, (bid_price + ask_price) / 2]
+            # Возвращаем 5 признаков
+            return [
+                float(bid_volume),
+                float(ask_volume),
+                float(bid_count),
+                float(ask_count),
+                float((bid_price + ask_price) / 2) if bid_price and ask_price else 0
+            ]
             
         except Exception as e:
             logger.error(f"Ошибка при расчете признаков кластеров: {e}")
+            logger.error(traceback.format_exc())
             return [0, 0, 0, 0, 0]
     
     def _extract_historical_patterns(self, historical: List[Dict]) -> List[float]:
@@ -254,10 +276,10 @@ class PricePredictionModel:
             
     async def predict(self, data: Dict) -> Dict:
         """
-        Получение предсказания от модели
+        Предсказание вероятности движения цены и размера позиции
         
         Args:
-            data: Словарь с данными для предсказания
+            data: Словарь с данными
             
         Returns:
             Dict: Словарь с предсказаниями
@@ -265,22 +287,23 @@ class PricePredictionModel:
         try:
             # Подготавливаем признаки
             features = self.prepare_features(data)
-            
             if features is None:
-                logger.error("Не удалось подготовить признаки для модели")
                 return {'probability': 0.5, 'position_size': 0.0}
             
-            # Получаем предсказания
-            probability, position_size = self.model.predict(features)
+            # Делаем предсказание асинхронно
+            loop = asyncio.get_event_loop()
+            probability, position_size = await loop.run_in_executor(
+                None, 
+                lambda: self.model.predict(features, verbose=0)
+            )
             
-            # Преобразуем в нужный формат
             return {
-                'probability': float(probability[0][0]),  # Вероятность движения
-                'position_size': float(position_size[0][0])  # Рекомендуемый размер позиции
+                'probability': float(probability[0][0]),
+                'position_size': float(position_size[0][0])
             }
             
         except Exception as e:
-            logger.error(f"Ошибка при получении предсказания: {e}")
+            logger.error(f"Ошибка при предсказании: {e}")
             logger.error(traceback.format_exc())
             return {'probability': 0.5, 'position_size': 0.0}
     
@@ -296,8 +319,8 @@ class PricePredictionModel:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             
             # Сохраняем модель
-            self.model.save(f"{path}_model")
-            logger.info(f"Модель сохранена в {path}_model")
+            self.model.save(f"{path}_model.keras")
+            logger.info(f"Модель сохранена в {path}_model.keras")
             
             # Сохраняем скейлер
             if self.scaler is not None:
@@ -335,8 +358,8 @@ class PricePredictionModel:
             self.last_training_time = datetime.fromisoformat(metadata['last_training_time']) if metadata['last_training_time'] else None
             
             # Загружаем модель
-            self.model = tf.keras.models.load_model(f"{path}_model", custom_objects={'AttentionLayer': AttentionLayer})
-            logger.info(f"Модель загружена из {path}_model")
+            self.model = tf.keras.models.load_model(f"{path}_model.keras", custom_objects={'AttentionLayer': AttentionLayer})
+            logger.info(f"Модель загружена из {path}_model.keras")
             
             # Загружаем скейлер
             scaler_path = f"{path}_scaler.joblib"

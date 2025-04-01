@@ -29,20 +29,54 @@ from market_analyzer import MarketAnalyzer
 from config import load_config
 from websocket_manager import WebSocketManager
 
+def cleanup_old_logs(log_dir: str = 'logs', max_files: int = 5) -> None:
+    """
+    Очистка старых лог-файлов, оставляя только последние max_files файлов
+    
+    Args:
+        log_dir: Директория с логами
+        max_files: Максимальное количество файлов для хранения
+    """
+    try:
+        # Получаем список всех лог-файлов
+        log_files = glob.glob(os.path.join(log_dir, 'trading_bot_*.log'))
+        
+        # Сортируем файлы по времени создания (новые первыми)
+        log_files.sort(key=os.path.getctime, reverse=True)
+        
+        # Удаляем старые файлы
+        for old_file in log_files[max_files:]:
+            try:
+                os.remove(old_file)
+                logger.info(f"Удален старый лог-файл: {old_file}")
+            except Exception as e:
+                logger.error(f"Ошибка при удалении файла {old_file}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка при очистке лог-файлов: {e}")
+
 # Создаем директорию для логов, если она не существует
 if not os.path.exists('logs'):
     os.makedirs('logs')
+
+# Очищаем старые лог-файлы
+cleanup_old_logs()
 
 # Создаем уникальное имя файла логов с временной меткой
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 log_file = f'logs/trading_bot_{timestamp}.log'
 
-# Настраиваем логирование
+# Настраиваем логирование с ротацией файлов
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
+        RotatingFileHandler(
+            log_file,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5,
+            encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
 )
@@ -105,7 +139,11 @@ async def main():
         )
         
         # Инициализация WebSocket менеджера
-        ws_manager = WebSocketManager(cache_timeout=1.0)
+        ws_manager = WebSocketManager(client=binance_client, cache_timeout=1.0)
+        
+        # Добавляем торговые пары
+        for symbol in config['trading_pairs']:
+            ws_manager.trading_pairs.append(symbol)
         
         # Инициализация компонентов
         telegram_notifier = TelegramNotifier(config)

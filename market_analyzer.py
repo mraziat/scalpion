@@ -239,114 +239,130 @@ class MarketAnalyzer:
         return False
 
     async def _update_liquidity_clusters(self, symbol: str) -> List[Dict]:
-        """Обновление кластеров ликвидности"""
+        """
+        Обновляет кластеры ликвидности для указанного символа
+        
+        Args:
+            symbol: Торговая пара
+            
+        Returns:
+            List[Dict]: Список кластеров ликвидности
+        """
         try:
-            if symbol not in self.orderbooks:
-                return []
-                
-            orderbook = self.orderbooks[symbol]
-            if orderbook.empty:
+            # Получаем стакан
+            orderbook = self.orderbooks.get(symbol)
+            if orderbook is None or orderbook.empty:
+                logger.warning(f"Пустой стакан для {symbol}")
                 return []
                 
             # Получаем текущую цену
             try:
-                # Сначала пробуем получить через REST API
                 ticker = self.binance_client.get_symbol_ticker(symbol=symbol)
-                current_price = Decimal(str(ticker['price']))
-                
-                # Проверяем, что цена находится в разумных пределах
-                if symbol == 'BTCUSDT':
-                    if current_price < 1000 or current_price > 100000:
-                        raise ValueError(f"Некорректная цена BTC: {current_price}")
-                elif symbol == 'ETHUSDT':
-                    if current_price < 100 or current_price > 10000:
-                        raise ValueError(f"Некорректная цена ETH: {current_price}")
-                elif symbol == 'BNBUSDT':
-                    if current_price < 10 or current_price > 1000:
-                        raise ValueError(f"Некорректная цена BNB: {current_price}")
-                elif symbol == 'SOLUSDT':
-                    if current_price < 1 or current_price > 1000:
-                        raise ValueError(f"Некорректная цена SOL: {current_price}")
-                elif symbol == 'XRPUSDT':
-                    if current_price < 0.1 or current_price > 10:
-                        raise ValueError(f"Некорректная цена XRP: {current_price}")
-                        
+                current_price = float(ticker['price'])
+                logger.info(f"Текущая цена для {symbol}: {current_price}")
             except Exception as e:
-                logger.error(f"Ошибка при получении текущей цены через REST API: {e}")
-                # Если не удалось получить через REST API, используем стакан
-                bids = orderbook[orderbook['side'] == 'bid']
-                asks = orderbook[orderbook['side'] == 'ask']
-                if not bids.empty and not asks.empty:
-                    best_bid = float(bids['price'].max())
-                    best_ask = float(asks['price'].min())
-                    current_price = Decimal(str((best_bid + best_ask) / 2))
-                else:
-                    logger.warning(f"Пустой стакан для {symbol}")
-                    return []
+                logger.error(f"Ошибка при получении текущей цены для {symbol}: {e}")
+                return []
+                
+            # Разделяем биды и аски
+            bids = orderbook[orderbook['side'] == 'bid'].sort_values('price', ascending=False)
+            asks = orderbook[orderbook['side'] == 'ask'].sort_values('price')
             
-            # Подготавливаем данные для анализа
-            orderbook_data = {
-                'current_price': current_price,
-                'bids': orderbook[orderbook['side'] == 'bid'][['price', 'quantity']].values.tolist(),
-                'asks': orderbook[orderbook['side'] == 'ask'][['price', 'quantity']].values.tolist()
-            }
-
-            # Анализируем кластеры
-            clusters = self._analyze_clusters(symbol)
-
-            # Проверяем изменения в кластерах
-            if symbol in self.previous_clusters:
-                changes = self._detect_cluster_changes(self.previous_clusters[symbol], clusters)
-                if changes:
-                    message = f"🔔 Изменения в кластерах {symbol}:\n\n"
-                    for change in changes:
-                        message += f"{change}\n"
-                    await self._send_telegram_message(message)
-            else:
-                # Первое обнаружение кластеров
-                if clusters:
-                    message = f"🔔 Обнаружены кластеры {symbol}:\n\n"
-                    
-                    # Группируем кластеры по стороне
-                    bid_clusters = [c for c in clusters if c['side'] == 'bid']
-                    ask_clusters = [c for c in clusters if c['side'] == 'ask']
-                    
-                    # Добавляем информацию о бидах
-                    if bid_clusters:
-                        message += "📈 Кластеры на покупку:\n"
-                        for cluster in bid_clusters:
-                            message += f"Цена: {cluster['price']:.8f}\n"
-                            message += f"Объем: {cluster['volume_usdt']:.2f} USDT\n"
-                            message += f"Ордера: {cluster['orders']}\n"
-                            message += f"Диапазон: [{cluster['min_price']:.8f}, {cluster['max_price']:.8f}]\n\n"
-                    
-                    # Добавляем информацию об асках
-                    if ask_clusters:
-                        message += "📉 Кластеры на продажу:\n"
-                        for cluster in ask_clusters:
-                            message += f"Цена: {cluster['price']:.8f}\n"
-                            message += f"Объем: {cluster['volume_usdt']:.2f} USDT\n"
-                            message += f"Ордера: {cluster['orders']}\n"
-                            message += f"Диапазон: [{cluster['min_price']:.8f}, {cluster['max_price']:.8f}]\n\n"
-                    
-                    # Добавляем общую статистику
-                    total_bid_volume = sum(c['volume_usdt'] for c in bid_clusters)
-                    total_ask_volume = sum(c['volume_usdt'] for c in ask_clusters)
-                    message += f"📊 Общая статистика:\n"
-                    message += f"Объем на покупку: {total_bid_volume:.2f} USDT\n"
-                    message += f"Объем на продажу: {total_ask_volume:.2f} USDT\n"
-                    message += f"Дисбаланс: {((total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume) * 100):.2f}%"
-                    
-                    await self._send_telegram_message(message)
-
-            # Сохраняем текущие кластеры
-            self.previous_clusters[symbol] = clusters
-
+            # Находим кластеры для бидов и асков
+            bid_clusters = self._find_clusters(bids, 'bid')
+            ask_clusters = self._find_clusters(asks, 'ask')
+            
+            # Объединяем кластеры
+            clusters = bid_clusters + ask_clusters
+            
+            # Сортируем по объему
+            clusters.sort(key=lambda x: x['cluster_volume'], reverse=True)
+            
+            # Фильтруем по минимальному объему и диапазону цены
+            min_volume = self.config.get('min_cluster_volume', 1.0)
+            price_range = 0.1  # 10% от текущей цены
+            clusters = [
+                c for c in clusters 
+                if c['cluster_volume'] >= min_volume 
+                and abs(c['price'] - current_price) / current_price <= price_range
+            ]
+            
+            logger.info(f"Найдено {len(clusters)} кластеров ликвидности для {symbol}")
             return clusters
-
+            
         except Exception as e:
-            logger.error(f"Ошибка при обновлении кластеров: {e}")
+            logger.error(f"Ошибка при обновлении кластеров ликвидности: {e}")
+            logger.error(traceback.format_exc())
             return []
+            
+    def _find_clusters(self, orders: pd.DataFrame, side: str) -> List[Dict]:
+        """
+        Находит кластеры ликвидности в ордерах
+        
+        Args:
+            orders: DataFrame с ордерами
+            side: Сторона (bid/ask)
+            
+        Returns:
+            List[Dict]: Список кластеров
+        """
+        if orders.empty:
+            return []
+            
+        clusters = []
+        current_cluster = None
+        
+        # Параметры для поиска кластеров
+        price_threshold = self.config.get('cluster_price_threshold', 0.001)  # 0.1%
+        min_orders = self.config.get('min_cluster_orders', 3)
+        
+        for _, order in orders.iterrows():
+            price = order['price']
+            volume = order['quantity'] * price
+            
+            if current_cluster is None:
+                # Создаем новый кластер
+                current_cluster = {
+                    'side': side,
+                    'price': price,
+                    'cluster_volume': volume,
+                    'orders': 1,
+                    'min_price': price,
+                    'max_price': price
+                }
+            else:
+                # Проверяем, относится ли ордер к текущему кластеру
+                price_diff = abs(price - current_cluster['price']) / current_cluster['price']
+                
+                if price_diff <= price_threshold:
+                    # Добавляем к текущему кластеру
+                    current_cluster['cluster_volume'] += volume
+                    current_cluster['orders'] += 1
+                    # Обновляем среднюю цену кластера
+                    current_cluster['price'] = (current_cluster['price'] * (current_cluster['orders'] - 1) + price) / current_cluster['orders']
+                    # Обновляем диапазон цен
+                    current_cluster['min_price'] = min(current_cluster['min_price'], price)
+                    current_cluster['max_price'] = max(current_cluster['max_price'], price)
+                else:
+                    # Сохраняем текущий кластер если он достаточно большой
+                    if current_cluster['orders'] >= min_orders:
+                        clusters.append(current_cluster)
+                    
+                    # Создаем новый кластер
+                    current_cluster = {
+                        'side': side,
+                        'price': price,
+                        'cluster_volume': volume,
+                        'orders': 1,
+                        'min_price': price,
+                        'max_price': price
+                    }
+        
+        # Добавляем последний кластер
+        if current_cluster and current_cluster['orders'] >= min_orders:
+            clusters.append(current_cluster)
+            
+        return clusters
 
     def _detect_cluster_changes(self, old_clusters: List[Dict], new_clusters: List[Dict]) -> List[str]:
         """Определение изменений в кластерах"""
@@ -362,19 +378,19 @@ class MarketAnalyzer:
                 changes.append(
                     f"🆕 Новый кластер {new_cluster['side']}:\n"
                     f"Цена: {new_cluster.get('price', new_cluster.get('price_range', '0'))}\n"
-                    f"Объем: {new_cluster.get('volume_usdt', 0):.2f} USDT\n"
+                    f"Объем: {new_cluster.get('cluster_volume', 0):.2f} USDT\n"
                     f"Ордера: {new_cluster.get('orders', 0)}\n"
                     f"Диапазон: [{new_cluster.get('min_price', 0):.8f}, {new_cluster.get('max_price', 0):.8f}]"
                 )
             else:
                 old_cluster = old_dict[key]
-                if abs(new_cluster.get('volume_usdt', 0) - old_cluster.get('volume_usdt', 0)) > self.volume_threshold:
+                if abs(new_cluster.get('cluster_volume', 0) - old_cluster.get('cluster_volume', 0)) > self.volume_threshold:
                     changes.append(
                         f"📊 Изменение объема кластера {new_cluster['side']}:\n"
                         f"Цена: {new_cluster.get('price', new_cluster.get('price_range', '0'))}\n"
-                        f"Старый объем: {old_cluster.get('volume_usdt', 0):.2f} USDT\n"
-                        f"Новый объем: {new_cluster.get('volume_usdt', 0):.2f} USDT\n"
-                        f"Изменение: {((new_cluster.get('volume_usdt', 0) - old_cluster.get('volume_usdt', 0)) / old_cluster.get('volume_usdt', 1) * 100):.2f}%"
+                        f"Старый объем: {old_cluster.get('cluster_volume', 0):.2f} USDT\n"
+                        f"Новый объем: {new_cluster.get('cluster_volume', 0):.2f} USDT\n"
+                        f"Изменение: {((new_cluster.get('cluster_volume', 0) - old_cluster.get('cluster_volume', 0)) / old_cluster.get('cluster_volume', 1) * 100):.2f}%"
                     )
         
         # Проверяем удаленные кластеры
@@ -383,7 +399,7 @@ class MarketAnalyzer:
                 changes.append(
                     f"❌ Удален кластер {old_cluster['side']}:\n"
                     f"Цена: {old_cluster.get('price', old_cluster.get('price_range', '0'))}\n"
-                    f"Объем: {old_cluster.get('volume_usdt', 0):.2f} USDT\n"
+                    f"Объем: {old_cluster.get('cluster_volume', 0):.2f} USDT\n"
                     f"Ордера: {old_cluster.get('orders', 0)}"
                 )
         
@@ -411,7 +427,7 @@ class MarketAnalyzer:
             return total_volume / total_orders
             
         except Exception as e:
-            self.logger.error(f"Ошибка при расчете среднего объема: {str(e)}")
+            logger.error(f"Ошибка при расчете среднего объема: {str(e)}")
             return 0
 
     def _monitor_performance(self, start_time: float, operation: str):
@@ -545,7 +561,7 @@ class MarketAnalyzer:
                     logger.info("Кластеры на покупку:")
                     for cluster in bid_clusters:
                         logger.info(f"Цена: {cluster['price_range'][0]:.8f} - {cluster['price_range'][1]:.8f}")
-                        logger.info(f"Объем: {cluster['volume']:.2f} USDT")
+                        logger.info(f"Объем: {cluster['cluster_volume']:.2f} USDT")
                         logger.info(f"Ордера: {cluster['orders']}")
                         logger.info("-" * 30)
                 
@@ -553,7 +569,7 @@ class MarketAnalyzer:
                     logger.info("Кластеры на продажу:")
                     for cluster in ask_clusters:
                         logger.info(f"Цена: {cluster['price_range'][0]:.8f} - {cluster['price_range'][1]:.8f}")
-                        logger.info(f"Объем: {cluster['volume']:.2f} USDT")
+                        logger.info(f"Объем: {cluster['cluster_volume']:.2f} USDT")
                         logger.info(f"Ордера: {cluster['orders']}")
                         logger.info("-" * 30)
                 
@@ -577,13 +593,13 @@ class MarketAnalyzer:
                 return
 
             # Проверяем, не отправляли ли мы уже уведомление для этого кластера
-            cluster_id = f"{symbol}_{cluster['price_range'][0]}_{cluster['volume']}"
+            cluster_id = f"{symbol}_{cluster['price_range'][0]}_{cluster['cluster_volume']}"
             
             if cluster_id in self.sent_notifications:
                 return
             
             # Форматируем объем
-            volume_str = self._format_volume(float(cluster['volume']))
+            volume_str = self._format_volume(float(cluster['cluster_volume']))
 
             # Определяем тип кластера
             cluster_type = "Покупка" if cluster['side'] == 'bid' else "Продажа"
@@ -886,7 +902,7 @@ class MarketAnalyzer:
                             abs(cluster['price_range'][1] - prev_cluster['price_range'][1]) < self.price_threshold):
                             is_new = False
                             # Проверяем значительное изменение объема
-                            if abs(cluster['volume'] - prev_cluster['volume']) > self.volume_threshold:
+                            if abs(cluster['cluster_volume'] - prev_cluster['cluster_volume']) > self.volume_threshold:
                                 self._send_cluster_notification(symbol, cluster, 'изменился')
                             break
                     
@@ -946,8 +962,8 @@ class MarketAnalyzer:
             
             # Отправляем уведомления о новых кластерах
             for cluster in clusters:
-                if (cluster['volume_usdt'] >= self.min_cluster_volume and 
-                    min_price <= float(cluster['start_price']) <= max_price):
+                if (cluster['cluster_volume'] >= self.min_cluster_volume and 
+                    min_price <= float(cluster['price']) <= max_price):
                     await self._send_cluster_notification(symbol, cluster)
                     
         except Exception as e:
@@ -960,7 +976,7 @@ class MarketAnalyzer:
             if symbol not in self.liquidity_clusters:
                 return 0.0
                 
-            volumes = [cluster['volume_usdt'] for cluster in self.liquidity_clusters[symbol]]
+            volumes = [cluster['cluster_volume'] for cluster in self.liquidity_clusters[symbol]]
             if not volumes:
                 return 0.0
                 
@@ -1005,21 +1021,21 @@ class MarketAnalyzer:
                     if not current_cluster:
                         current_cluster = {
                             'price_range': [price, price],
-                            'volume': volume_usdt,
+                            'cluster_volume': volume_usdt,
                             'orders': 1,
                             'side': side
                         }
                     elif abs(price - current_cluster['price_range'][1]) <= self.price_step:
                         current_cluster['price_range'][1] = price
-                        current_cluster['volume'] += volume_usdt
+                        current_cluster['cluster_volume'] += volume_usdt
                         current_cluster['orders'] += 1
                     else:
-                        if (current_cluster['volume'] >= Decimal(str(self.min_cluster_volume)) and 
+                        if (current_cluster['cluster_volume'] >= Decimal(str(self.min_cluster_volume)) and 
                             current_cluster['orders'] >= self.min_cluster_size):
                             clusters.append(current_cluster)
                         current_cluster = {
                             'price_range': [price, price],
-                            'volume': volume_usdt,
+                            'cluster_volume': volume_usdt,
                             'orders': 1,
                             'side': side
                         }
@@ -1028,7 +1044,7 @@ class MarketAnalyzer:
                     continue
             
             # Добавляем последний кластер
-            if current_cluster and (current_cluster['volume'] >= Decimal(str(self.min_cluster_volume)) and 
+            if current_cluster and (current_cluster['cluster_volume'] >= Decimal(str(self.min_cluster_volume)) and 
                                   current_cluster['orders'] >= self.min_cluster_size):
                 clusters.append(current_cluster)
             

@@ -73,90 +73,97 @@ class TradingStrategy:
         
         logger.info("Инициализирована торговая стратегия")
         
-    async def process_orderbook(self, data: Dict) -> None:
+    async def process_orderbook(self, orderbook: Dict) -> None:
         """
         Обработка данных стакана
         
         Args:
-            data: Данные стакана в формате Binance WebSocket, тестовых данных или DataFrame
+            orderbook: Стакан в формате Binance
         """
         try:
-            # Определяем формат входных данных
-            if isinstance(data, pd.DataFrame):
-                orderbook_data = data
-                symbol = self.symbol
-            else:
-                # Получаем символ из данных (поддерживаем оба формата)
-                symbol = data.get('s', data.get('symbol', self.symbol))
+            if orderbook is None or not isinstance(orderbook, dict):
+                logger.warning("Пустой или неверный формат стакана")
+                return
                 
-                # Преобразуем данные в DataFrame
-                if 'data' in data:  # WebSocket формат
-                    ws_data = data['data']
-                    logger.debug(f"Получены WebSocket данные: {ws_data}")
-                    
-                    # Проверяем наличие необходимых полей
-                    if 'b' not in ws_data or 'a' not in ws_data:
-                        logger.error(f"Отсутствуют необходимые поля в данных стакана: {ws_data}")
-                        return
-                    
-                    # Преобразуем биды и аски
-                    bids_data = [[float(price), float(qty), 'bid'] for price, qty in ws_data['b']]
-                    asks_data = [[float(price), float(qty), 'ask'] for price, qty in ws_data['a']]
-                    
-                    orderbook_data = pd.DataFrame(bids_data + asks_data, columns=['price', 'quantity', 'side'])
-                elif 'bids' in data and 'asks' in data:  # REST API формат
-                    bids_data = [[float(price), float(qty), 'bid'] for price, qty in data['bids']]
-                    asks_data = [[float(price), float(qty), 'ask'] for price, qty in data['asks']]
-                    orderbook_data = pd.DataFrame(bids_data + asks_data, columns=['price', 'quantity', 'side'])
-                else:
-                    logger.error(f"Неверный формат данных стакана для {symbol}")
-                    logger.error(f"Полученные данные: {data}")
-                    return
+            # Проверяем наличие необходимых данных
+            if 'bids' not in orderbook or 'asks' not in orderbook:
+                logger.warning("Отсутствуют данные бидов или асков в стакане")
+                return
+                
+            # Преобразуем данные в DataFrame
+            bids_data = [[float(price), float(qty), 'bid'] for price, qty in orderbook['bids']]
+            asks_data = [[float(price), float(qty), 'ask'] for price, qty in orderbook['asks']]
             
-            logger.info(f"\nОбработка стакана для {symbol}")
-            logger.info(f"Размер стакана: {len(orderbook_data)} ордеров")
-            logger.info(f"Биды: {len(orderbook_data[orderbook_data['side'] == 'bid'])} ордеров")
-            logger.info(f"Аски: {len(orderbook_data[orderbook_data['side'] == 'ask'])} ордеров")
+            orderbook_df = pd.DataFrame(bids_data + asks_data, columns=['price', 'quantity', 'side'])
+            
+            # Логируем размер стакана
+            logger.info(f"\nОбработка стакана для {self.symbol}")
+            logger.info(f"Размер стакана: {len(orderbook_df)} ордеров")
+            logger.info(f"Биды: {len(orderbook_df[orderbook_df['side'] == 'bid'])} ордеров")
+            logger.info(f"Аски: {len(orderbook_df[orderbook_df['side'] == 'ask'])} ордеров")
             
             # Получаем текущую цену
-            if not orderbook_data.empty:
-                bids = orderbook_data[orderbook_data['side'] == 'bid'].sort_values('price', ascending=False)
-                asks = orderbook_data[orderbook_data['side'] == 'ask'].sort_values('price', ascending=True)
+            try:
+                ticker = self.market_analyzer.binance_client.get_symbol_ticker(symbol=self.symbol)
+                current_price = float(ticker['price'])
+                logger.info(f"Текущая цена с биржи: {current_price:.8f}")
+            except Exception as e:
+                logger.error(f"Ошибка при получении текущей цены с биржи: {e}")
+                return
                 
-                if not bids.empty and not asks.empty:
-                    current_price = (float(bids.iloc[0]['price']) + float(asks.iloc[0]['price'])) / 2
-                    logger.info(f"Текущая цена: {current_price}")
-                    
-                    # Обновляем данные стакана в MarketAnalyzer
-                    self.market_analyzer.orderbooks[symbol] = orderbook_data
-                    self.market_analyzer._update_metrics(symbol)
-                    
-                    # Получаем кластеры ликвидности
-                    liquidity_clusters = await self.market_analyzer._update_liquidity_clusters(symbol)
-                    self.market_analyzer.liquidity_clusters[symbol] = liquidity_clusters
-                    
-                    if liquidity_clusters:
-                        logger.info(f"Найдены кластеры ликвидности: {len(liquidity_clusters)}")
-                        for cluster in liquidity_clusters:
-                            logger.info(f"Кластер: сторона={cluster['side']}, "
-                                      f"цена={cluster['price_range'][0]:.8f} - {cluster['price_range'][1]:.8f}, "
-                                      f"объем={cluster['volume']:.2f} USDT, "
-                                      f"ордера={cluster['orders']}")
-                    
-                        # Анализируем сигналы
-                        signal = await self.analyze_signals(orderbook_data)
-                        
-                        if signal:
-                            logger.info(f"Получен сигнал: {signal}")
-                            await self._execute_signal(signal)
-                        else:
-                            logger.info("Нет сигналов для входа/выхода")
-                    else:
-                        logger.warning("Не найдены кластеры ликвидности")
-                else:
-                    logger.warning("Пустой стакан (нет бидов или асков)")
-            else:
-                logger.warning("Получен пустой стакан")
+            # Обновляем данные стакана в MarketAnalyzer
+            self.market_analyzer.orderbooks[self.symbol] = orderbook_df
+            
+            # Получаем кластеры ликвидности
+            clusters = await self.market_analyzer._update_liquidity_clusters(self.symbol)
+            
+            if not clusters:
+                logger.warning("Не найдены кластеры ликвидности")
+                return
+                
+            logger.info(f"Найдены кластеры ликвидности: {len(clusters)}")
+            
+            # Анализируем каждый кластер
+            for cluster in clusters:
+                logger.info(
+                    f"Кластер: цена={cluster['price']:.8f}, "
+                    f"объем={cluster['cluster_volume']:.8f}, "
+                    f"ордеров={cluster['orders']}, "
+                    f"сторона={cluster['side']}"
+                )
+                
+            # Проверяем условия для входа в позицию
+            if self._check_entry_conditions(clusters, current_price):
+                # Определяем направление сделки
+                side = self._determine_trade_side(clusters, current_price)
+                
+                # Рассчитываем размер позиции
+                position_size = self.risk_manager.calculate_position_size(
+                    self.symbol,
+                    current_price,
+                    side
+                )
+                
+                # Рассчитываем уровни стоп-лосс и тейк-профит
+                stop_loss, take_profit = self._calculate_sl_tp(
+                    current_price,
+                    side,
+                    clusters
+                )
+                
+                # Создаем сигнал
+                signal = {
+                    'symbol': self.symbol,
+                    'side': side,
+                    'price': current_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'position_size': position_size,
+                    'timestamp': datetime.now()
+                }
+                
+                # Исполняем сигнал
+                await self._execute_signal(signal)
                 
         except Exception as e:
             logger.error(f"Ошибка при обработке стакана: {e}")
@@ -165,14 +172,13 @@ class TradingStrategy:
     async def analyze_signals(self, orderbook_data: pd.DataFrame) -> Dict:
         """Анализ сигналов на основе данных стакана"""
         try:
-            # Получаем текущую цену
-            bids = orderbook_data[orderbook_data['side'] == 'bid'].sort_values('price', ascending=False)
-            asks = orderbook_data[orderbook_data['side'] == 'ask'].sort_values('price', ascending=True)
-            
-            if not bids.empty and not asks.empty:
-                current_price = (float(bids.iloc[0]['price']) + float(asks.iloc[0]['price'])) / 2
-            else:
-                logger.warning("Не удалось получить текущую цену: пустой стакан")
+            # Получаем текущую цену через REST API
+            try:
+                ticker = self.market_analyzer.binance_client.get_symbol_ticker(symbol=self.symbol)
+                current_price = float(ticker['price'])
+                logger.info(f"Текущая цена с биржи: {current_price:.8f}")
+            except Exception as e:
+                logger.error(f"Ошибка при получении текущей цены с биржи: {e}")
                 return None
             
             # Получаем кластеры ликвидности
@@ -272,7 +278,7 @@ class TradingStrategy:
         try:
             # Фильтруем значимые кластеры
             significant_clusters = [c for c in liquidity_clusters 
-                                  if c['volume'] >= self.min_cluster_volume and
+                                  if c['cluster_volume'] >= self.min_cluster_volume and
                                   c['orders'] >= self.min_orders_in_cluster]
             
             if side == 'buy':
@@ -320,8 +326,8 @@ class TradingStrategy:
             ask_clusters = [c for c in liquidity_clusters if c['side'] == 'ask']
             
             # Считаем общий объем по каждой стороне
-            bid_volume = sum(c['volume'] for c in bid_clusters)
-            ask_volume = sum(c['volume'] for c in ask_clusters)
+            bid_volume = sum(c['cluster_volume'] for c in bid_clusters)
+            ask_volume = sum(c['cluster_volume'] for c in ask_clusters)
             
             # Определяем сторону на основе объема
             if bid_volume > ask_volume:
@@ -600,7 +606,7 @@ class TradingStrategy:
 
             # Получаем текущую цену
             try:
-                ticker = self.binance_client.get_symbol_ticker(symbol=symbol)
+                ticker = self.market_analyzer.binance_client.get_symbol_ticker(symbol=symbol)
                 current_price = Decimal(str(ticker['price']))
                 logger.info(f"Текущая цена: {current_price}")
             except Exception as e:
@@ -626,3 +632,42 @@ class TradingStrategy:
 
         except Exception as e:
             logger.error(f"Ошибка при анализе стакана: {str(e)}") 
+
+    def _check_entry_conditions(self, clusters: List[Dict], current_price: float) -> bool:
+        """
+        Проверяет условия для входа в позицию
+        
+        Args:
+            clusters: Список кластеров ликвидности
+            current_price: Текущая цена
+            
+        Returns:
+            bool: True если условия выполнены, False иначе
+        """
+        try:
+            # Проверяем наличие значимых кластеров
+            significant_clusters = [c for c in clusters if c['cluster_volume'] >= self.min_cluster_volume]
+            if not significant_clusters:
+                logger.warning("Нет значимых кластеров ликвидности")
+                return False
+                
+            # Проверяем наличие кластеров выше и ниже текущей цены
+            clusters_above = [c for c in significant_clusters if c['price'] > current_price]
+            clusters_below = [c for c in significant_clusters if c['price'] < current_price]
+            
+            if not clusters_above or not clusters_below:
+                logger.warning("Нет кластеров с обеих сторон от текущей цены")
+                return False
+                
+            # Проверяем предсказание модели
+            if self.current_probability < self.entry_probability_threshold:
+                logger.warning(f"Низкая вероятность входа: {self.current_probability:.2f}")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка при проверке условий входа: {str(e)}")
+            return False
+        
+        return True 
